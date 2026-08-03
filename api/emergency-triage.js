@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
-import { Client, RunTree } from 'langsmith';
+import { Client } from 'langsmith';
+import { traceable } from 'langsmith/traceable';
 
+// Server-side environment variables (never exposed to client)
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = 'gemini-1.5-flash';
 
@@ -20,162 +22,105 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  let parentRun = null;
-  let client = null;
+  const apiKey = (process.env.LANGSMITH_API_KEY || '').trim();
+  const tracingEnv = (process.env.LANGSMITH_TRACING || '').trim();
+  const isTracingEnabled = Boolean(apiKey) && tracingEnv === 'true';
 
-  // Read LangSmith server-side environment variables
-  const langsmithApiKey = (process.env.LANGSMITH_API_KEY || '').trim();
-  const langsmithProject = (process.env.LANGSMITH_PROJECT || 'animopulse-ai').trim();
-  const langsmithEndpoint = (process.env.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com').trim();
-  const isTracingEnabled = (process.env.LANGSMITH_TRACING === 'true' || Boolean(langsmithApiKey)) && Boolean(langsmithApiKey);
+  const langsmithClient = new Client({
+    apiKey: apiKey || 'dummy-key-for-disabled-tracing',
+    apiUrl: (process.env.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com').trim()
+  });
+
+  const projectName = (process.env.LANGSMITH_PROJECT || 'animopulse-ai').trim();
 
   if (isTracingEnabled) {
     console.log('[LangSmith] tracing enabled');
-    try {
-      client = new Client({
-        apiKey: langsmithApiKey,
-        apiUrl: langsmithEndpoint
-      });
-    } catch (err) {
-      console.error('[LangSmith] trace failed:', err?.message || String(err));
-    }
   }
 
-  try {
-    // 1. Validate Supabase Authenticated Access Token
-    const authHeader = req.headers.authorization || req.headers.Authorization || '';
-    const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized: Missing authentication token' });
+  // 1. Nested Traceable: authenticate-user
+  const traceAuthUser = traceable(
+    async (supabase, token) => {
+      const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+      if (authError || !user) return null;
+      return user;
+    },
+    {
+      name: 'authenticate-user',
+      run_type: 'chain',
+      client: langsmithClient,
+      project_name: projectName,
+      tracingEnabled: isTracingEnabled
     }
+  );
 
-    // Read & trim Supabase environment variables
-    const supabaseUrl = (process.env.VITE_SUPABASE_URL || '').trim();
-    const supabaseAnonKey = (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
-
-    // Validate Supabase URL format (must start with https:// and end with .supabase.co)
-    if (!supabaseUrl || !supabaseUrl.startsWith('https://') || !supabaseUrl.endsWith('.supabase.co')) {
-      console.error('[Supabase Configuration Error] Invalid or missing VITE_SUPABASE_URL');
-      return res.status(500).json({ error: 'Server Configuration Error: Invalid or missing VITE_SUPABASE_URL environment variable. Expected format: https://<project-ref>.supabase.co' });
+  // 2. Nested Traceable: validate-triage-input
+  const traceValidateTriageInput = traceable(
+    async (animalType, isStray, emergencyType, userDescription) => {
+      return {
+        animal_type: animalType,
+        is_stray: isStray,
+        emergency_type: emergencyType,
+        description_length: (userDescription || '').length,
+        validated: true
+      };
+    },
+    {
+      name: 'validate-triage-input',
+      run_type: 'chain',
+      client: langsmithClient,
+      project_name: projectName,
+      tracingEnabled: isTracingEnabled
     }
+  );
 
-    if (!supabaseAnonKey) {
-      console.error('[Supabase Configuration Error] Missing VITE_SUPABASE_ANON_KEY');
-      return res.status(500).json({ error: 'Server Configuration Error: Missing VITE_SUPABASE_ANON_KEY environment variable' });
-    }
+  // 3. Nested Traceable: urgency-classification
+  const traceUrgencyClassification = traceable(
+    async (triageAnswers, userDescription, emergencyType) => {
+      let urgencyLevel = 'Moderate';
+      const descLower = ((userDescription || '') + ' ' + (emergencyType || '')).toLowerCase();
 
-    const supabase = createClient(supabaseUrl, supabaseAnonKey);
-
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid or expired access token' });
-    }
-
-    const {
-      animalType = 'Dog',
-      isStray = false,
-      emergencyType = 'Wound',
-      userDescription = '',
-      triageAnswers = {},
-      petId = null
-    } = req.body || {};
-
-    // Initialize Parent Trace Run (animopulse-emergency-triage)
-    if (client) {
-      try {
-        parentRun = new RunTree({
-          name: 'animopulse-emergency-triage',
-          run_type: 'chain',
-          inputs: {
-            user_id: user.id,
-            pet_id: petId,
-            animal_type: animalType,
-            is_stray: isStray,
-            emergency_type: emergencyType
-          },
-          project_name: langsmithProject,
-          client
-        });
-      } catch (e) {
-        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      if (
+        triageAnswers.severe_bleeding || 
+        triageAnswers.hit_by_vehicle || 
+        triageAnswers.is_conscious === 'No' || 
+        triageAnswers.is_breathing === 'Not breathing' ||
+        descLower.includes('hit by car') ||
+        descLower.includes('unconscious') ||
+        descLower.includes('severe bleeding') ||
+        descLower.includes('choking')
+      ) {
+        urgencyLevel = 'Critical';
+      } else if (
+        triageAnswers.poisoning_suspected ||
+        triageAnswers.seizures ||
+        triageAnswers.unable_to_stand === 'Unable to stand' ||
+        triageAnswers.unable_to_stand === true ||
+        descLower.includes('poison') ||
+        descLower.includes('seizure') ||
+        descLower.includes('heatstroke')
+      ) {
+        urgencyLevel = 'High';
+      } else if (descLower.includes('wound') || descLower.includes('limp') || descLower.includes('burn') || descLower.includes('fracture')) {
+        urgencyLevel = 'Moderate';
+      } else {
+        urgencyLevel = 'Low';
       }
+
+      return urgencyLevel;
+    },
+    {
+      name: 'urgency-classification',
+      run_type: 'chain',
+      client: langsmithClient,
+      project_name: projectName,
+      tracingEnabled: isTracingEnabled
     }
+  );
 
-    // Child Operation 1: authenticate-user
-    if (parentRun) {
-      try {
-        const authChild = parentRun.createChild({
-          name: 'authenticate-user',
-          run_type: 'chain',
-          inputs: { user_id: user.id }
-        });
-        authChild.end({ status: 'authenticated', user_id: user.id });
-      } catch (e) {
-        console.error('[LangSmith] trace failed:', e?.message || String(e));
-      }
-    }
-
-    // Child Operation 2: validate-triage-input
-    if (parentRun) {
-      try {
-        const valChild = parentRun.createChild({
-          name: 'validate-triage-input',
-          run_type: 'chain',
-          inputs: { animal_type: animalType, is_stray: isStray, emergency_type: emergencyType }
-        });
-        valChild.end({ validated: true });
-      } catch (e) {
-        console.error('[LangSmith] trace failed:', e?.message || String(e));
-      }
-    }
-
-    // Child Operation 3: urgency-classification
-    let urgencyLevel = 'Moderate';
-    const descLower = (userDescription + ' ' + emergencyType).toLowerCase();
-
-    if (
-      triageAnswers.severe_bleeding || 
-      triageAnswers.hit_by_vehicle || 
-      triageAnswers.is_conscious === 'No' || 
-      triageAnswers.is_breathing === 'Not breathing' ||
-      descLower.includes('hit by car') ||
-      descLower.includes('unconscious') ||
-      descLower.includes('severe bleeding') ||
-      descLower.includes('choking')
-    ) {
-      urgencyLevel = 'Critical';
-    } else if (
-      triageAnswers.poisoning_suspected ||
-      triageAnswers.seizures ||
-      triageAnswers.unable_to_stand === 'Unable to stand' ||
-      triageAnswers.unable_to_stand === true ||
-      descLower.includes('poison') ||
-      descLower.includes('seizure') ||
-      descLower.includes('heatstroke')
-    ) {
-      urgencyLevel = 'High';
-    } else if (descLower.includes('wound') || descLower.includes('limp') || descLower.includes('burn') || descLower.includes('fracture')) {
-      urgencyLevel = 'Moderate';
-    } else {
-      urgencyLevel = 'Low';
-    }
-
-    if (parentRun) {
-      try {
-        const triageChild = parentRun.createChild({
-          name: 'urgency-classification',
-          run_type: 'chain',
-          inputs: { emergency_type: emergencyType, answers: triageAnswers }
-        });
-        triageChild.end({ calculated_urgency: urgencyLevel });
-      } catch (e) {
-        console.error('[LangSmith] trace failed:', e?.message || String(e));
-      }
-    }
-
-    // Child Operation 4: prompt-construction
-    const emergencyPrompt = `${EMERGENCY_ASSISTANT_SYSTEM_PROMPT}
+  // 4. Nested Traceable: prompt-construction
+  const tracePromptConstruction = traceable(
+    async (animalType, isStray, emergencyType, triageAnswers, userDescription, urgencyLevel) => {
+      const emergencyPrompt = `${EMERGENCY_ASSISTANT_SYSTEM_PROMPT}
 
 [EMERGENCY TRACT INTAKE DATA]
 - Animal Type: ${animalType}
@@ -198,104 +143,153 @@ Provide structured first-aid guidance into JSON format with keys:
 "warningSigns" (array of symptoms requiring immediate ER care),
 "medicalDisclaimer" (string disclaimer).`;
 
-    if (parentRun) {
-      try {
-        const promptChild = parentRun.createChild({
-          name: 'prompt-construction',
-          run_type: 'chain',
-          inputs: { prompt_length: emergencyPrompt.length }
-        });
-        promptChild.end({ constructed: true });
-      } catch (e) {
-        console.error('[LangSmith] trace failed:', e?.message || String(e));
-      }
+      return emergencyPrompt;
+    },
+    {
+      name: 'prompt-construction',
+      run_type: 'chain',
+      client: langsmithClient,
+      project_name: projectName,
+      tracingEnabled: isTracingEnabled
     }
+  );
 
-    // Child Operation 5: gemini-generation
-    let result = null;
-    let geminiError = null;
+  // 5. Nested Traceable: gemini-generation
+  const traceGeminiGeneration = traceable(
+    async (emergencyPrompt, emergencyType, userDescription, triageAnswers, urgencyLevel) => {
+      let result = null;
+      if (GEMINI_API_KEY) {
+        try {
+          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts: [{ text: emergencyPrompt }] }]
+            })
+          });
 
-    if (GEMINI_API_KEY) {
-      try {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: emergencyPrompt }] }]
-          })
-        });
+          const data = await response.json();
+          const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-        const data = await response.json();
-        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-        if (rawText) {
-          try {
-            const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              result = JSON.parse(jsonMatch[0]);
+          if (rawText) {
+            try {
+              const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+              if (jsonMatch) {
+                result = JSON.parse(jsonMatch[0]);
+              }
+            } catch (parseErr) {
+              console.warn('[Gemini Emergency JSON Parse Fallback]', parseErr);
             }
-          } catch (parseErr) {
-            console.warn('[Gemini Emergency JSON Parse Fallback]', parseErr);
           }
+        } catch (err) {
+          console.warn('[Gemini Emergency API Exception, using emergency matrix engine]', err);
         }
-      } catch (err) {
-        geminiError = err;
-        console.warn('[Gemini Emergency API Exception, using emergency matrix engine]', err);
       }
-    }
 
-    if (!result || !result.immediateSteps) {
-      result = generateEmergencyMatrixGuidance(emergencyType, userDescription, triageAnswers, urgencyLevel);
-    }
-
-    if (parentRun) {
-      try {
-        const geminiChild = parentRun.createChild({
-          name: 'gemini-generation',
-          run_type: 'llm',
-          inputs: { model: GEMINI_MODEL }
-        });
-        geminiChild.end({
-          urgency_level: result.urgencyLevel,
-          steps_count: (result.immediateSteps || []).length
-        }, geminiError ? String(geminiError) : undefined);
-      } catch (e) {
-        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      if (!result || !result.immediateSteps) {
+        result = generateEmergencyMatrixGuidance(emergencyType, userDescription, triageAnswers, urgencyLevel);
       }
+      return result;
+    },
+    {
+      name: 'gemini-generation',
+      run_type: 'llm',
+      client: langsmithClient,
+      project_name: projectName,
+      tracingEnabled: isTracingEnabled
     }
+  );
 
-    // Child Operation 6: save-emergency-session
-    if (parentRun) {
-      try {
-        const saveChild = parentRun.createChild({
-          name: 'save-emergency-session',
-          run_type: 'chain',
-          inputs: { user_id: user.id, pet_id: petId }
-        });
-        saveChild.end({ saved: true });
-      } catch (e) {
-        console.error('[LangSmith] trace failed:', e?.message || String(e));
+  // 6. Nested Traceable: save-emergency-session
+  const traceSaveEmergencySession = traceable(
+    async (user, petId, urgencyLevel, stepsCount) => {
+      return { saved: true, user_id: user.id, pet_id: petId, urgency_level: urgencyLevel, steps_count: stepsCount };
+    },
+    {
+      name: 'save-emergency-session',
+      run_type: 'chain',
+      client: langsmithClient,
+      project_name: projectName,
+      tracingEnabled: isTracingEnabled
+    }
+  );
+
+  // Outer Workflow Traceable: animopulse-emergency-triage
+  const executeWorkflow = traceable(
+    async (authHeader, body) => {
+      const token = (authHeader || '').replace(/^Bearer\s+/i, '').trim();
+      if (!token) return { status: 401, error: 'Unauthorized: Missing authentication token' };
+
+      const supabaseUrl = (process.env.VITE_SUPABASE_URL || '').trim();
+      const supabaseAnonKey = (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+
+      if (!supabaseUrl || !supabaseUrl.startsWith('https://') || !supabaseUrl.endsWith('.supabase.co')) {
+        return { status: 500, error: 'Server Configuration Error: Invalid or missing VITE_SUPABASE_URL environment variable.' };
       }
-    }
+      if (!supabaseAnonKey) {
+        return { status: 500, error: 'Server Configuration Error: Missing VITE_SUPABASE_ANON_KEY environment variable.' };
+      }
 
-    // End Parent Run & Await Pending Trace Submission Before Responding
-    if (parentRun && client) {
+      const supabase = createClient(supabaseUrl, supabaseAnonKey);
+      const user = await traceAuthUser(supabase, token);
+      if (!user) return { status: 401, error: 'Unauthorized: Invalid or expired access token' };
+
+      const {
+        animalType = 'Dog',
+        isStray = false,
+        emergencyType = 'Wound',
+        userDescription = '',
+        triageAnswers = {},
+        petId = null
+      } = body || {};
+
+      await traceValidateTriageInput(animalType, isStray, emergencyType, userDescription);
+      const urgencyLevel = await traceUrgencyClassification(triageAnswers, userDescription, emergencyType);
+      const emergencyPrompt = await tracePromptConstruction(animalType, isStray, emergencyType, triageAnswers, userDescription, urgencyLevel);
+      const result = await traceGeminiGeneration(emergencyPrompt, emergencyType, userDescription, triageAnswers, urgencyLevel);
+      await traceSaveEmergencySession(user, petId, result.urgencyLevel || urgencyLevel, (result.immediateSteps || []).length);
+
+      return {
+        status: 200,
+        data: result
+      };
+    },
+    {
+      name: 'animopulse-emergency-triage',
+      run_type: 'chain',
+      client: langsmithClient,
+      project_name: projectName,
+      tracingEnabled: isTracingEnabled
+    }
+  );
+
+  try {
+    const result = await executeWorkflow(req.headers.authorization || req.headers.Authorization, req.body);
+
+    if (isTracingEnabled) {
       try {
-        parentRun.end({
-          urgency_level: result.urgencyLevel,
-          steps_count: (result.immediateSteps || []).length
-        });
-        await parentRun.postRun();
-        await client.awaitPendingTrace();
+        await langsmithClient.awaitPendingTraceBatches();
         console.log('[LangSmith] trace submitted');
-      } catch (traceErr) {
-        console.error('[LangSmith] trace failed:', traceErr?.message || String(traceErr));
+      } catch (flushErr) {
+        console.error('[LangSmith] trace failed:', flushErr?.message || String(flushErr));
       }
     }
 
-    return res.status(200).json(result);
+    if (result.error) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    return res.status(200).json(result.data);
   } catch (err) {
-    console.error('[Emergency Triage API Handler Error]', err);
+    console.error('[Emergency Triage Handler Error]', err);
+
+    if (isTracingEnabled) {
+      try {
+        await langsmithClient.awaitPendingTraceBatches();
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
+    }
+
     return res.status(500).json({ error: err.message || 'Internal Server Error' });
   }
 }
@@ -305,7 +299,7 @@ function generateEmergencyMatrixGuidance(emergencyType, userDescription, triageA
   let actionsToAvoid = [];
   let warningSigns = [];
 
-  const descLower = (userDescription + ' ' + emergencyType).toLowerCase();
+  const descLower = ((userDescription || '') + ' ' + (emergencyType || '')).toLowerCase();
 
   if (descLower.includes('bleed') || descLower.includes('wound') || descLower.includes('laceration')) {
     immediateSteps = [
