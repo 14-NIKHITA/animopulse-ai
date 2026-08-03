@@ -1,13 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import { Client, RunTree } from 'langsmith';
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = 'gemini-1.5-flash';
-
-const LANGSMITH_API_KEY = process.env.LANGSMITH_API_KEY || '';
-const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || 'animopulse-ai';
-const LANGSMITH_ENDPOINT = process.env.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com';
-const IS_LANGSMITH_TRACING = process.env.LANGSMITH_TRACING === 'true' || Boolean(LANGSMITH_API_KEY);
 
 const EMERGENCY_ASSISTANT_SYSTEM_PROMPT = `You are AnimoPulse Emergency Animal First-Aid Assistant.
 Guidelines:
@@ -27,6 +22,24 @@ export default async function handler(req, res) {
 
   let parentRun = null;
   let client = null;
+
+  // Read LangSmith server-side environment variables
+  const langsmithApiKey = (process.env.LANGSMITH_API_KEY || '').trim();
+  const langsmithProject = (process.env.LANGSMITH_PROJECT || 'animopulse-ai').trim();
+  const langsmithEndpoint = (process.env.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com').trim();
+  const isTracingEnabled = (process.env.LANGSMITH_TRACING === 'true' || Boolean(langsmithApiKey)) && Boolean(langsmithApiKey);
+
+  if (isTracingEnabled) {
+    console.log('[LangSmith] tracing enabled');
+    try {
+      client = new Client({
+        apiKey: langsmithApiKey,
+        apiUrl: langsmithEndpoint
+      });
+    } catch (err) {
+      console.error('[LangSmith] trace failed:', err?.message || String(err));
+    }
+  }
 
   try {
     // 1. Validate Supabase Authenticated Access Token
@@ -68,10 +81,9 @@ export default async function handler(req, res) {
       petId = null
     } = req.body || {};
 
-    // 2. Initialize LangSmith Parent Run
-    if (IS_LANGSMITH_TRACING && LANGSMITH_API_KEY) {
+    // Initialize Parent Trace Run (animopulse-emergency-triage)
+    if (client) {
       try {
-        client = new Client({ apiKey: LANGSMITH_API_KEY, apiUrl: LANGSMITH_ENDPOINT });
         parentRun = new RunTree({
           name: 'animopulse-emergency-triage',
           run_type: 'chain',
@@ -82,30 +94,43 @@ export default async function handler(req, res) {
             is_stray: isStray,
             emergency_type: emergencyType
           },
-          project_name: LANGSMITH_PROJECT,
+          project_name: langsmithProject,
           client
         });
-        await parentRun.postRun();
       } catch (e) {
-        console.warn('[LangSmith Parent Trace Init Warning]', e);
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
       }
     }
 
-    // Child Run: Auth Validation
+    // Child Operation 1: authenticate-user
     if (parentRun) {
       try {
-        const authChild = await parentRun.createChild({
-          name: 'authentication validation',
+        const authChild = parentRun.createChild({
+          name: 'authenticate-user',
           run_type: 'chain',
-          inputs: { user_id: user.id, authenticated: true }
+          inputs: { user_id: user.id }
         });
-        await authChild.postRun();
-        await authChild.end({ outputs: { status: 'authenticated', user_id: user.id } });
-        await authChild.postRun();
-      } catch (e) { console.warn(e); }
+        authChild.end({ status: 'authenticated', user_id: user.id });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Triage Assessment Intake & Urgency Classification
+    // Child Operation 2: validate-triage-input
+    if (parentRun) {
+      try {
+        const valChild = parentRun.createChild({
+          name: 'validate-triage-input',
+          run_type: 'chain',
+          inputs: { animal_type: animalType, is_stray: isStray, emergency_type: emergencyType }
+        });
+        valChild.end({ validated: true });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
+    }
+
+    // Child Operation 3: urgency-classification
     let urgencyLevel = 'Moderate';
     const descLower = (userDescription + ' ' + emergencyType).toLowerCase();
 
@@ -138,18 +163,18 @@ export default async function handler(req, res) {
 
     if (parentRun) {
       try {
-        const triageChild = await parentRun.createChild({
-          name: 'urgency classification',
+        const triageChild = parentRun.createChild({
+          name: 'urgency-classification',
           run_type: 'chain',
           inputs: { emergency_type: emergencyType, answers: triageAnswers }
         });
-        await triageChild.postRun();
-        await triageChild.end({ outputs: { calculated_urgency: urgencyLevel } });
-        await triageChild.postRun();
-      } catch (e) { console.warn(e); }
+        triageChild.end({ calculated_urgency: urgencyLevel });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Prompt Construction
+    // Child Operation 4: prompt-construction
     const emergencyPrompt = `${EMERGENCY_ASSISTANT_SYSTEM_PROMPT}
 
 [EMERGENCY TRACT INTAKE DATA]
@@ -175,18 +200,18 @@ Provide structured first-aid guidance into JSON format with keys:
 
     if (parentRun) {
       try {
-        const promptChild = await parentRun.createChild({
-          name: 'prompt construction',
+        const promptChild = parentRun.createChild({
+          name: 'prompt-construction',
           run_type: 'chain',
           inputs: { prompt_length: emergencyPrompt.length }
         });
-        await promptChild.postRun();
-        await promptChild.end({ outputs: { constructed: true } });
-        await promptChild.postRun();
-      } catch (e) { console.warn(e); }
+        promptChild.end({ constructed: true });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Gemini Generation
+    // Child Operation 5: gemini-generation
     let result = null;
     let geminiError = null;
 
@@ -225,46 +250,46 @@ Provide structured first-aid guidance into JSON format with keys:
 
     if (parentRun) {
       try {
-        const geminiChild = await parentRun.createChild({
-          name: 'Gemini generation',
+        const geminiChild = parentRun.createChild({
+          name: 'gemini-generation',
           run_type: 'llm',
           inputs: { model: GEMINI_MODEL }
         });
-        await geminiChild.postRun();
-        await geminiChild.end({
-          outputs: { urgency_level: result.urgencyLevel, steps_count: (result.immediateSteps || []).length },
-          error: geminiError ? String(geminiError) : undefined
-        });
-        await geminiChild.postRun();
-      } catch (e) { console.warn(e); }
+        geminiChild.end({
+          urgency_level: result.urgencyLevel,
+          steps_count: (result.immediateSteps || []).length
+        }, geminiError ? String(geminiError) : undefined);
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Database Save
+    // Child Operation 6: save-emergency-session
     if (parentRun) {
       try {
-        const dbChild = await parentRun.createChild({
-          name: 'database save',
+        const saveChild = parentRun.createChild({
+          name: 'save-emergency-session',
           run_type: 'chain',
           inputs: { user_id: user.id, pet_id: petId }
         });
-        await dbChild.postRun();
-        await dbChild.end({ outputs: { saved: true } });
-        await dbChild.postRun();
-      } catch (e) { console.warn(e); }
+        saveChild.end({ saved: true });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Finalize Parent Run & Flush Pending Traces
-    if (parentRun) {
+    // End Parent Run & Await Pending Trace Submission Before Responding
+    if (parentRun && client) {
       try {
-        await parentRun.end({
-          outputs: {
-            urgency_level: result.urgencyLevel,
-            steps_count: (result.immediateSteps || []).length
-          }
+        parentRun.end({
+          urgency_level: result.urgencyLevel,
+          steps_count: (result.immediateSteps || []).length
         });
         await parentRun.postRun();
-      } catch (e) {
-        console.warn('[LangSmith End Error]', e);
+        await client.awaitPendingTrace();
+        console.log('[LangSmith] trace submitted');
+      } catch (traceErr) {
+        console.error('[LangSmith] trace failed:', traceErr?.message || String(traceErr));
       }
     }
 

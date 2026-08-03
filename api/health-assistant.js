@@ -2,13 +2,8 @@ import { createClient } from '@supabase/supabase-js';
 import { Client, RunTree } from 'langsmith';
 
 // Server-side environment variables (never exposed to client)
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = 'gemini-1.5-flash';
-
-const LANGSMITH_API_KEY = process.env.LANGSMITH_API_KEY || '';
-const LANGSMITH_PROJECT = process.env.LANGSMITH_PROJECT || 'animopulse-ai';
-const LANGSMITH_ENDPOINT = process.env.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com';
-const IS_LANGSMITH_TRACING = process.env.LANGSMITH_TRACING === 'true' || Boolean(LANGSMITH_API_KEY);
 
 const HEALTH_ASSISTANT_SYSTEM_PROMPT = `You are AnimoPulse AI Health Assistant, a specialized animal health information assistant.
 Guidelines:
@@ -32,6 +27,24 @@ export default async function handler(req, res) {
   const startTime = Date.now();
   let parentRun = null;
   let client = null;
+
+  // Read LangSmith server-side environment variables
+  const langsmithApiKey = (process.env.LANGSMITH_API_KEY || '').trim();
+  const langsmithProject = (process.env.LANGSMITH_PROJECT || 'animopulse-ai').trim();
+  const langsmithEndpoint = (process.env.LANGSMITH_ENDPOINT || 'https://api.smith.langchain.com').trim();
+  const isTracingEnabled = (process.env.LANGSMITH_TRACING === 'true' || Boolean(langsmithApiKey)) && Boolean(langsmithApiKey);
+
+  if (isTracingEnabled) {
+    console.log('[LangSmith] tracing enabled');
+    try {
+      client = new Client({
+        apiKey: langsmithApiKey,
+        apiUrl: langsmithEndpoint
+      });
+    } catch (err) {
+      console.error('[LangSmith] trace failed:', err?.message || String(err));
+    }
+  }
 
   try {
     // 1. Validate Supabase Authenticated Access Token
@@ -70,10 +83,9 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Bad Request: Question is required' });
     }
 
-    // 2. Initialize LangSmith Client & Parent Trace Run (If Configured)
-    if (IS_LANGSMITH_TRACING && LANGSMITH_API_KEY) {
+    // Initialize Parent Trace Run (animopulse-health-assistant)
+    if (client) {
       try {
-        client = new Client({ apiKey: LANGSMITH_API_KEY, apiUrl: LANGSMITH_ENDPOINT });
         parentRun = new RunTree({
           name: 'animopulse-health-assistant',
           run_type: 'chain',
@@ -83,44 +95,43 @@ export default async function handler(req, res) {
             question_length: question.length,
             medical_records_count: (medicalRecords || []).length
           },
-          project_name: LANGSMITH_PROJECT,
+          project_name: langsmithProject,
           client
         });
-        await parentRun.postRun();
       } catch (e) {
-        console.warn('[LangSmith Parent Trace Init Warning]', e);
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
       }
     }
 
-    // Child Run: Auth Validation
+    // Child Operation 1: authenticate-user
     if (parentRun) {
       try {
-        const authChild = await parentRun.createChild({
-          name: 'authentication validation',
+        const authChild = parentRun.createChild({
+          name: 'authenticate-user',
           run_type: 'chain',
-          inputs: { user_id: user.id, authenticated: true }
+          inputs: { user_id: user.id }
         });
-        await authChild.postRun();
-        await authChild.end({ outputs: { status: 'authenticated', user_id: user.id } });
-        await authChild.postRun();
-      } catch (e) { console.warn(e); }
+        authChild.end({ status: 'authenticated', user_id: user.id });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Pet & Vaccination Loading
+    // Child Operation 2: load-pet-context
     if (parentRun) {
       try {
-        const petChild = await parentRun.createChild({
-          name: 'pet loading',
+        const petChild = parentRun.createChild({
+          name: 'load-pet-context',
           run_type: 'chain',
-          inputs: { pet_id: pet?.id, pet_name: pet?.name }
+          inputs: { pet_id: pet?.id, animal_type: pet?.animal_type || 'Pet' }
         });
-        await petChild.postRun();
-        await petChild.end({ outputs: { loaded: true, breed: pet?.breed || 'N/A' } });
-        await petChild.postRun();
-      } catch (e) { console.warn(e); }
+        petChild.end({ loaded: true, breed: pet?.breed || 'N/A' });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Document Retrieval (RAG)
+    // Child Operation 3: rag-retrieval
     let retrievedChunks = [];
     const petId = pet?.id;
     if (petId && Array.isArray(medicalRecords) && medicalRecords.length > 0) {
@@ -154,23 +165,21 @@ export default async function handler(req, res) {
 
     if (parentRun) {
       try {
-        const ragChild = await parentRun.createChild({
-          name: 'animopulse-rag-retrieval',
+        const ragChild = parentRun.createChild({
+          name: 'rag-retrieval',
           run_type: 'retriever',
-          inputs: { user_id: user.id, pet_id: petId, query: question }
+          inputs: { user_id: user.id, pet_id: petId, query_length: question.length }
         });
-        await ragChild.postRun();
-        await ragChild.end({
-          outputs: {
-            retrieved_count: retrievedChunks.length,
-            sources: sourceTitles
-          }
+        ragChild.end({
+          retrieved_count: retrievedChunks.length,
+          sources: sourceTitles
         });
-        await ragChild.postRun();
-      } catch (e) { console.warn(e); }
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Prompt Construction
+    // Child Operation 4: prompt-construction
     const contextSummary = `
 [SELECTED PET PROFILE]
 - Name: ${pet?.name || 'Unknown'}
@@ -190,18 +199,18 @@ ${retrievedChunks.length > 0 ? retrievedChunks.map(c => `--- Source: ${c.title} 
 
     if (parentRun) {
       try {
-        const promptChild = await parentRun.createChild({
-          name: 'prompt construction',
+        const promptChild = parentRun.createChild({
+          name: 'prompt-construction',
           run_type: 'chain',
           inputs: { prompt_length: fullPrompt.length, has_retrieved_chunks: retrievedChunks.length > 0 }
         });
-        await promptChild.postRun();
-        await promptChild.end({ outputs: { constructed: true } });
-        await promptChild.postRun();
-      } catch (e) { console.warn(e); }
+        promptChild.end({ constructed: true });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Gemini Generation
+    // Child Operation 5: gemini-generation
     let answerText = '';
     let geminiError = null;
 
@@ -229,50 +238,47 @@ ${retrievedChunks.length > 0 ? retrievedChunks.map(c => `--- Source: ${c.title} 
 
     if (parentRun) {
       try {
-        const geminiChild = await parentRun.createChild({
-          name: 'Gemini generation',
+        const geminiChild = parentRun.createChild({
+          name: 'gemini-generation',
           run_type: 'llm',
           inputs: { model: GEMINI_MODEL }
         });
-        await geminiChild.postRun();
-        await geminiChild.end({
-          outputs: {
-            response_length: answerText.length,
-            generated: Boolean(answerText)
-          },
-          error: geminiError ? String(geminiError) : undefined
-        });
-        await geminiChild.postRun();
-      } catch (e) { console.warn(e); }
+        geminiChild.end({
+          response_length: answerText.length,
+          generated: Boolean(answerText)
+        }, geminiError ? String(geminiError) : undefined);
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Child Run: Database Save
+    // Child Operation 6: save-conversation
     if (parentRun) {
       try {
-        const dbChild = await parentRun.createChild({
-          name: 'database save',
+        const saveChild = parentRun.createChild({
+          name: 'save-conversation',
           run_type: 'chain',
           inputs: { user_id: user.id, pet_id: petId }
         });
-        await dbChild.postRun();
-        await dbChild.end({ outputs: { saved: true } });
-        await dbChild.postRun();
-      } catch (e) { console.warn(e); }
+        saveChild.end({ saved: true });
+      } catch (e) {
+        console.error('[LangSmith] trace failed:', e?.message || String(e));
+      }
     }
 
-    // Finalize Parent Run & Flush Pending Traces
-    if (parentRun) {
+    // End Parent Run & Await Pending Trace Submission Before Responding
+    if (parentRun && client) {
       try {
-        await parentRun.end({
-          outputs: {
-            sources_count: sourceTitles.length,
-            sources: sourceTitles,
-            response_snippet: answerText.slice(0, 150)
-          }
+        parentRun.end({
+          sources_count: sourceTitles.length,
+          sources: sourceTitles,
+          response_length: answerText.length
         });
         await parentRun.postRun();
-      } catch (e) {
-        console.warn('[LangSmith End Error]', e);
+        await client.awaitPendingTrace();
+        console.log('[LangSmith] trace submitted');
+      } catch (traceErr) {
+        console.error('[LangSmith] trace failed:', traceErr?.message || String(traceErr));
       }
     }
 
