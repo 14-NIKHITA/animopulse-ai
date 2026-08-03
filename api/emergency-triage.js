@@ -37,8 +37,21 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: 'Unauthorized: Missing authentication token' });
     }
 
-    const supabaseUrl = process.env.VITE_SUPABASE_URL || 'https://snmjybnyzciciopbrnyy.supabase.co';
-    const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY || '';
+    // Read & trim Supabase environment variables
+    const supabaseUrl = (process.env.VITE_SUPABASE_URL || '').trim();
+    const supabaseAnonKey = (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+
+    // Validate Supabase URL format (must start with https:// and end with .supabase.co)
+    if (!supabaseUrl || !supabaseUrl.startsWith('https://') || !supabaseUrl.endsWith('.supabase.co')) {
+      console.error('[Supabase Configuration Error] Invalid or missing VITE_SUPABASE_URL');
+      return res.status(500).json({ error: 'Server Configuration Error: Invalid or missing VITE_SUPABASE_URL environment variable. Expected format: https://<project-ref>.supabase.co' });
+    }
+
+    if (!supabaseAnonKey) {
+      console.error('[Supabase Configuration Error] Missing VITE_SUPABASE_ANON_KEY');
+      return res.status(500).json({ error: 'Server Configuration Error: Missing VITE_SUPABASE_ANON_KEY environment variable' });
+    }
+
     const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
